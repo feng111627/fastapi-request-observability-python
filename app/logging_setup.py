@@ -63,3 +63,17 @@ def get_request_logger(log_dir: str, log_file: str, max_bytes: int, backup_count
         logger.addHandler(handler)
         _loggers[path] = logger
         return logger
+
+
+def reset_loggers() -> None:
+    """Close and forget cached loggers (tests / settings-driven rebuild).
+
+    Rotation parameters are fixed when a handler is created; changing
+    them at runtime requires recreating the handler via this reset.
+    """
+    with _loggers_lock:
+        for logger in _loggers.values():
+            for handler in list(logger.handlers):
+                handler.close()
+                logger.removeHandler(handler)
+        _loggers.clear()

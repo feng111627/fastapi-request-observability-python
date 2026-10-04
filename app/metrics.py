@@ -11,6 +11,9 @@ class MetricsSnapshot:
     errors: dict[str, int] = field(default_factory=dict)
     slow: int = 0
     sampled_out: int = 0
+    background_total: int = 0
+    background_failed: int = 0
+    trace_mismatches: int = 0
 
 
 class MetricsRegistry:
@@ -35,6 +38,19 @@ class MetricsRegistry:
             if not logged:
                 self._snapshot.sampled_out += 1
 
+    def record_background(self, *, error_kind: str) -> None:
+        """Record one finished background task and its failure (if any)."""
+        with self._lock:
+            self._snapshot.background_total += 1
+            if error_kind != "none":
+                self._snapshot.background_failed += 1
+                self._snapshot.errors[error_kind] = self._snapshot.errors.get(error_kind, 0) + 1
+
+    def record_mismatch(self) -> None:
+        """Record one downstream call that echoed a different trace id."""
+        with self._lock:
+            self._snapshot.trace_mismatches += 1
+
     def snapshot(self) -> MetricsSnapshot:
         with self._lock:
             return MetricsSnapshot(
@@ -42,6 +58,9 @@ class MetricsRegistry:
                 errors=dict(self._snapshot.errors),
                 slow=self._snapshot.slow,
                 sampled_out=self._snapshot.sampled_out,
+                background_total=self._snapshot.background_total,
+                background_failed=self._snapshot.background_failed,
+                trace_mismatches=self._snapshot.trace_mismatches,
             )
 
     def reset(self) -> None:

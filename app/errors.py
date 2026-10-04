@@ -9,6 +9,7 @@ class ErrorKind(str, Enum):
     BUSINESS = "business"
     VALIDATION = "validation"
     TIMEOUT = "timeout"
+    PROPAGATION = "propagation"
     UNCAUGHT = "uncaught"
 
 
@@ -22,3 +23,12 @@ class BusinessError(Exception):
 
 class OperationTimeout(Exception):
     """A stage or the whole request exceeded its time budget."""
+
+
+class TracePropagationError(Exception):
+    """The cross-service trace id was not propagated intact.
+
+    Raised when a downstream call does not echo the same trace id the
+    caller sent, so a crossed/missing identifier is surfaced loudly
+    instead of being silently merged into another trace.
+    """

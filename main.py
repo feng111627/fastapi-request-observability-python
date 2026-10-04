@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import random
+import os
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -11,16 +11,36 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import settings_holder
-from app.context import current_trace_id, timed_stage
-from app.errors import BusinessError, ErrorKind, OperationTimeout
-from app.context import mark_error
+from app.context import current_trace_id, mark_error, timed_stage
+from app.downstream import downstream_app
+from app.errors import BusinessError, ErrorKind, OperationTimeout, TracePropagationError
 from app.metrics import metrics_registry
 from app.middleware import TraceMiddleware
-from app.propagate import run_in_background, trace_headers
+from app.propagate import trace_headers
+from app.replay import trace_replayer
 from app.sampling import sampling_policy
+from app.tasks import run_in_background, task_result_store
+from app import traced_http
 
-app = FastAPI(title="observability-demo")
+app = FastAPI(title="observability-demo", lifespan=None)
 app.add_middleware(TraceMiddleware)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    # Local, offline reproduction: the "downstream service" is reached
+    # over an isolated in-process ASGI transport. Set
+    # DOWNSTREAM_BASE_URL to call a separately started process instead.
+    base = os.environ.get("DOWNSTREAM_BASE_URL")
+    if base:
+        traced_http.configure_clients(downstream_app, real_base_url=base)
+    else:
+        traced_http.configure_clients(downstream_app)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await traced_http.aclose_http()
 
 
 @app.exception_handler(BusinessError)
@@ -38,6 +58,19 @@ async def timeout_handler(request: Request, exc: OperationTimeout) -> JSONRespon
     return JSONResponse(
         status_code=504,
         content={"detail": str(exc), "trace_id": current_trace_id()},
+    )
+
+
+@app.exception_handler(TracePropagationError)
+async def propagation_handler(request: Request, exc: TracePropagationError) -> JSONResponse:
+    mark_error(ErrorKind.PROPAGATION.value)
+    return JSONResponse(
+        status_code=502,
+        content={
+            "detail": str(exc),
+            "error_kind": ErrorKind.PROPAGATION.value,
+            "trace_id": current_trace_id(),
+        },
     )
 
 
@@ -90,19 +123,60 @@ async def crash() -> dict:
 
 
 @app.get("/background")
-async def background() -> dict:
-    async def work() -> None:
-        with timed_stage("background-work"):
-            await asyncio.sleep(0.01)
+async def background(fail: bool = False) -> dict:
+    """Schedule a task that keeps running after the response and is observed."""
 
-    run_in_background(work)
+    async def work() -> str:
+        with timed_stage("background-work"):
+            await asyncio.sleep(0.02)
+        if fail:
+            raise RuntimeError("background task failed on purpose")
+        return f"processed for {current_trace_id()}"
+
+    run_in_background(work, name="demo-background")
     return {"scheduled": True, "trace_id": current_trace_id()}
+
+
+@app.get("/tasks/{trace_id}")
+def get_task_results(trace_id: str) -> dict:
+    """Background-task outcomes attributable to one request."""
+    results = task_result_store.get(trace_id)
+    return {
+        "trace_id": trace_id,
+        "found": bool(results),
+        "count": len(results),
+        "results": [r.as_event() for r in results],
+    }
 
 
 @app.get("/outbound")
 async def outbound() -> dict:
     # In a real service these headers go onto the httpx/requests call.
     return {"would_send_headers": trace_headers()}
+
+
+@app.get("/chain")
+async def chain(lie: bool = False, work_ms: int = 5) -> dict:
+    """Cross-service scenario: really call the local downstream and verify."""
+    trace_id = current_trace_id()
+    with timed_stage("downstream-echo"):
+        call = await traced_http.call_downstream("/echo", lie=lie, timeout=5.0)
+    return {
+        "trace_id": trace_id,
+        "downstream_url": call.url,
+        "downstream_status": call.status_code,
+        "trace_sent": call.trace_sent,
+        "trace_received": call.trace_received,
+        "matched": call.matched,
+        "downstream_duration_ms": call.duration_ms,
+        "downstream_body": call.body,
+    }
+
+
+@app.get("/replay/{trace_id}")
+def replay(trace_id: str) -> dict:
+    """Replay the whole trace (entry + downstream + background) by id."""
+    return trace_replayer.replay(trace_id)
 
 
 @app.get("/metrics")
@@ -113,6 +187,9 @@ def metrics() -> dict:
         "errors": snap.errors,
         "slow": snap.slow,
         "sampled_out": snap.sampled_out,
+        "background_total": snap.background_total,
+        "background_failed": snap.background_failed,
+        "trace_mismatches": snap.trace_mismatches,
     }
 
 

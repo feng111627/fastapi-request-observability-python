@@ -10,10 +10,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import settings_holder
 from app.context import TraceContext, reset_trace, set_trace
-from app.errors import ErrorKind
-from app.logging_setup import get_request_logger
+from app.errors import ErrorKind, TracePropagationError
+from app.events import emit_event
 from app.metrics import metrics_registry
 from app.propagate import TRACE_HEADER
+from app.replay import trace_replayer
 from app.sampling import sampling_policy
 
 _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -37,8 +38,9 @@ def _extract_trace_id(scope: Scope) -> str:
 class TraceMiddleware:
     """Pure-ASGI middleware so it wraps routing and exception handlers."""
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, service_name: str = "upstream") -> None:
         self.app = app
+        self.service_name = service_name
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -52,12 +54,17 @@ class TraceMiddleware:
             method=scope.get("method", ""),
         )
         token = set_trace(ctx)
+        trace_replayer.note_seen(ctx.trace_id)
         status_code = 500
         start = time.perf_counter()
         try:
             await self.app(scope, receive, self._wrap_send(send, ctx, scope))
             # status captured by wrapped send; default below if never set
             status_code = getattr(ctx, "_status_code", 200)  # noqa: B009
+        except TracePropagationError as exc:
+            ctx.mark_error(ErrorKind.PROPAGATION.value)
+            status_code = 502
+            await self._send_error(send, ctx, status_code, str(exc), ErrorKind.PROPAGATION.value)
         except Exception as exc:  # uncaught: classify, log, synthesise 500
             ctx.mark_error(ErrorKind.UNCAUGHT.value)
             status_code = 500
@@ -71,12 +78,32 @@ class TraceMiddleware:
         async def sender(message: Message) -> None:
             if message["type"] == "http.response.start":
                 ctx._status_code = message["status"]  # type: ignore[attr-defined]
-                headers = list(message.get("headers", []))
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name != TRACE_HEADER.lower().encode()
+                ]
                 headers.append((TRACE_HEADER.lower().encode(), ctx.trace_id.encode()))
                 message["headers"] = headers
             await send(message)
 
         return sender
+
+    async def _send_error(
+        self, send: Send, ctx: TraceContext, status: int, detail: str, kind: str
+    ) -> None:
+        body = json.dumps(
+            {"detail": detail, "trace_id": ctx.trace_id, "error_kind": kind}
+        ).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (TRACE_HEADER.lower().encode(), ctx.trace_id.encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
     async def _send_500(self, send: Send, ctx: TraceContext, exc: Exception) -> None:
         body = json.dumps(
@@ -102,21 +129,15 @@ class TraceMiddleware:
         metrics_registry.record(error_kind=ctx.error_kind, is_slow=is_slow, logged=keep)
         if not keep:
             return
-        logger = get_request_logger(
-            settings.log_dir, settings.log_file,
-            settings.rotation_max_bytes, settings.rotation_backup_count,
-        )
-        logger.info(
+        emit_event(
             "request",
-            extra={"trace": {
-                "trace_id": ctx.trace_id,
-                "method": ctx.method,
-                "path": ctx.path,
-                "status": status_code,
-                "duration_ms": round(duration_ms, 3),
-                "slow": is_slow,
-                "slow_threshold_ms": settings.slow_request_ms,
-                "error_kind": ctx.error_kind,
-                "stages": [{"name": s.name, "duration_ms": s.duration_ms} for s in ctx.stages],
-            }},
+            service=self.service_name,
+            method=ctx.method,
+            path=ctx.path,
+            status=status_code,
+            duration_ms=round(duration_ms, 3),
+            slow=is_slow,
+            slow_threshold_ms=settings.slow_request_ms,
+            error_kind=ctx.error_kind,
+            stages=[{"name": s.name, "duration_ms": s.duration_ms} for s in ctx.stages],
         )
