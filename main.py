@@ -12,12 +12,22 @@ from pydantic import BaseModel
 
 from app.config import settings_holder
 from app.context import current_trace_id, timed_stage
-from app.errors import BusinessError, ErrorKind, OperationTimeout
+from app.downstream_client import call_downstream
+from app.errors import (
+    BusinessError,
+    DownstreamError,
+    ErrorKind,
+    OperationTimeout,
+    TraceMismatchError,
+)
 from app.context import mark_error
 from app.metrics import metrics_registry
 from app.middleware import TraceMiddleware
 from app.propagate import run_in_background, trace_headers
+from app.replay import build_timeline
 from app.sampling import sampling_policy
+from app.segments import segment_store
+from app.tasks import run_observed
 
 app = FastAPI(title="observability-demo")
 app.add_middleware(TraceMiddleware)
@@ -47,6 +57,27 @@ async def validation_handler(request: Request, exc: RequestValidationError) -> J
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors(), "trace_id": current_trace_id()},
+    )
+
+
+@app.exception_handler(DownstreamError)
+async def downstream_error_handler(request: Request, exc: DownstreamError) -> JSONResponse:
+    mark_error(ErrorKind.DOWNSTREAM.value)
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc), "trace_id": current_trace_id(),
+                 "error_kind": ErrorKind.DOWNSTREAM.value},
+    )
+
+
+@app.exception_handler(TraceMismatchError)
+async def trace_mismatch_handler(request: Request, exc: TraceMismatchError) -> JSONResponse:
+    mark_error(ErrorKind.TRACE_MISMATCH.value)
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc), "trace_id": current_trace_id(),
+                 "error_kind": ErrorKind.TRACE_MISMATCH.value,
+                 "sent_trace_id": exc.sent, "echoed_trace_id": exc.echoed},
     )
 
 
@@ -105,6 +136,47 @@ async def outbound() -> dict:
     return {"would_send_headers": trace_headers()}
 
 
+@app.get("/relay")
+async def relay(ms: int = 20, fail: bool = False) -> dict:
+    """Call the downstream service for real and verify the echoed trace id."""
+    sent = current_trace_id()
+    with timed_stage("downstream-call"):
+        result = await call_downstream("/work", params={"ms": ms, "fail": fail})
+    return {
+        "sent_trace_id": sent,
+        "downstream": result,
+        "echo_matches": result.get("trace_id") == sent,
+    }
+
+
+@app.post("/jobs")
+async def schedule_job(ms: int = 50, fail: bool = False) -> dict:
+    """Schedule a background job that stays observable after the response."""
+
+    async def job() -> str:
+        with timed_stage("job-work"):
+            await asyncio.sleep(ms / 1000)
+        if fail:
+            raise RuntimeError("background job failed")
+        return f"job done after {ms}ms"
+
+    run_observed("demo-job", job)
+    return {"scheduled": True, "trace_id": current_trace_id()}
+
+
+@app.get("/traces/{trace_id}")
+async def replay_trace(trace_id: str) -> JSONResponse:
+    """Merge every recorded segment of one trace id into a timeline."""
+    timeline = build_timeline(trace_id)
+    if timeline is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "trace not found or already evicted",
+                     "trace_id": trace_id, "found": False},
+        )
+    return JSONResponse(content={"found": True, **timeline})
+
+
 @app.get("/metrics")
 def metrics() -> dict:
     snap = metrics_registry.snapshot()
@@ -113,6 +185,8 @@ def metrics() -> dict:
         "errors": snap.errors,
         "slow": snap.slow,
         "sampled_out": snap.sampled_out,
+        "background_total": snap.background_total,
+        "background_errors": snap.background_errors,
     }
 
 
@@ -125,25 +199,44 @@ def get_config() -> dict:
         "log_dir": s.log_dir,
         "rotation_max_bytes": s.rotation_max_bytes,
         "rotation_backup_count": s.rotation_backup_count,
+        "service_name": s.service_name,
+        "downstream_url": s.downstream_url,
+        "segment_max_traces": s.segment_max_traces,
+        "segment_max_per_trace": s.segment_max_per_trace,
     }
 
 
 class ConfigUpdate(BaseModel):
     slow_request_ms: float | None = None
     sample_rate: float | None = None
+    downstream_url: str | None = None
+    segment_max_traces: int | None = None
+    segment_max_per_trace: int | None = None
 
 
 @app.post("/config")
 def update_config(update: ConfigUpdate) -> dict:
     changes = {}
-    if update.slow_request_ms is not None:
-        changes["slow_request_ms"] = update.slow_request_ms
+    for key in ("slow_request_ms", "downstream_url",
+                "segment_max_traces", "segment_max_per_trace"):
+        value = getattr(update, key)
+        if value is not None:
+            changes[key] = value
     if changes:
         settings_holder.update(**changes)
+    s = settings_holder.get()
+    segment_store.configure(s.segment_max_traces, s.segment_max_per_trace)
     if update.sample_rate is not None:
         sampling_policy.set_rate(update.sample_rate)
     return get_config()
 
 
 if __name__ == "__main__":
+    import sys
+
+    if "--with-downstream" in sys.argv:
+        import downstream
+
+        downstream.run_server(port=8001)
+        print("downstream listening on 127.0.0.1:8001")
     uvicorn.run(app, host="127.0.0.1", port=8000)

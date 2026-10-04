@@ -19,6 +19,10 @@ class ObservabilitySettings:
     log_file: str = "requests.log"
     rotation_max_bytes: int = 1_048_576
     rotation_backup_count: int = 3
+    service_name: str = "upstream"
+    downstream_url: str = "http://127.0.0.1:8001"
+    segment_max_traces: int = 1000
+    segment_max_per_trace: int = 100
 
 
 class SettingsHolder:

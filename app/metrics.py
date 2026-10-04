@@ -11,6 +11,8 @@ class MetricsSnapshot:
     errors: dict[str, int] = field(default_factory=dict)
     slow: int = 0
     sampled_out: int = 0
+    background_total: int = 0
+    background_errors: int = 0
 
 
 class MetricsRegistry:
@@ -35,6 +37,13 @@ class MetricsRegistry:
             if not logged:
                 self._snapshot.sampled_out += 1
 
+    def record_background(self, *, failed: bool) -> None:
+        """Count a finished background task; failures are never dropped."""
+        with self._lock:
+            self._snapshot.background_total += 1
+            if failed:
+                self._snapshot.background_errors += 1
+
     def snapshot(self) -> MetricsSnapshot:
         with self._lock:
             return MetricsSnapshot(
@@ -42,6 +51,8 @@ class MetricsRegistry:
                 errors=dict(self._snapshot.errors),
                 slow=self._snapshot.slow,
                 sampled_out=self._snapshot.sampled_out,
+                background_total=self._snapshot.background_total,
+                background_errors=self._snapshot.background_errors,
             )
 
     def reset(self) -> None:

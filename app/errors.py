@@ -10,6 +10,9 @@ class ErrorKind(str, Enum):
     VALIDATION = "validation"
     TIMEOUT = "timeout"
     UNCAUGHT = "uncaught"
+    DOWNSTREAM = "downstream"
+    TRACE_MISMATCH = "trace_mismatch"
+    BACKGROUND = "background"
 
 
 class BusinessError(Exception):
@@ -22,3 +25,16 @@ class BusinessError(Exception):
 
 class OperationTimeout(Exception):
     """A stage or the whole request exceeded its time budget."""
+
+
+class DownstreamError(Exception):
+    """The downstream call failed (connection, 5xx, or bad payload)."""
+
+
+class TraceMismatchError(Exception):
+    """The trace id echoed by the downstream differs from the one sent."""
+
+    def __init__(self, sent: str, echoed: str | None) -> None:
+        super().__init__(f"trace id mismatch: sent={sent!r} echoed={echoed!r}")
+        self.sent = sent
+        self.echoed = echoed
