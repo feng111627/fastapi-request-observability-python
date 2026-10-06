@@ -14,6 +14,7 @@ import time
 from app.config import settings_holder
 from app.context import current_trace_id
 from app.logging_setup import get_request_logger
+from app.replay import trace_replayer
 
 _seq_lock = threading.Lock()
 _seq = 0
@@ -51,3 +52,9 @@ def emit_event(msg: str, **fields: object) -> None:
         settings.rotation_backup_count,
     )
     logger.info(msg, extra={"trace": fields})
+    # Record the id only now that a line was really written: the replay
+    # "seen" set is evidence that on-disk records existed, so an id
+    # missing from the files means rotation (not a never-seen request).
+    trace_id = fields.get("trace_id")
+    if isinstance(trace_id, str) and trace_id != "-":
+        trace_replayer.note_seen(trace_id)

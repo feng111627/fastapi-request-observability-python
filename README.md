@@ -15,7 +15,8 @@ uv run pytest -v               # 运行全部测试
 
 ## 追踪字段含义
 
-每个请求结束时（未被采样丢弃的话）会向 `logs/requests.log` 写入一行 JSON：
+每个请求结束时都会向 `logs/requests.log` 写入一行 JSON 入口记录：被采样采掉细节的
+正常请求写的是精简锚点（`sampled=false`），其余为全量记录（`sampled=true`）：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -26,7 +27,8 @@ uv run pytest -v               # 运行全部测试
 | `slow` | 是否慢请求：`duration_ms >= slow_request_ms` 即为 `true`（含边界）。 |
 | `slow_threshold_ms` | 判定慢请求时使用的阈值快照。 |
 | `error_kind` | 异常分类：`none` / `business` / `validation` / `timeout` / `propagation` / `uncaught`。 |
-| `stages` | 分阶段耗时列表 `[{"name", "duration_ms"}]`，由业务代码用 `timed_stage("name")` 记录，用于定位慢点。 |
+| `sampled` | 入口片段是否保留全量细节：`true` 为采样保留（或报错/慢请求强制保留），`false` 为被采样率采掉细节后留下的**精简锚点**（见"采样与回放"）。下游调用、后台任务片段不带此字段（它们始终全量记录）。 |
+| `stages` | 分阶段耗时列表 `[{"name", "duration_ms"}]`，由业务代码用 `timed_stage("name")` 记录，用于定位慢点。**仅在 `sampled=true` 的入口记录中出现。** |
 | `service` | 产生该事件的服务名（`upstream` / `downstream`）。 |
 | `seq` / `ts_ms` | 进程内单调递增序号与 epoch 毫秒时间戳，用于把同标识的多个事件合并排序成一条时间线。 |
 
@@ -95,16 +97,25 @@ uv run pytest -v               # 运行全部测试
 | 字段 | 含义 |
 | --- | --- |
 | `found` | 是否找到片段。`false` 时不报错，HTTP 200。 |
-| `reason` | `found=false` 时：`unknown`（本进程从未见过该标识）或 `rotated_away`（本进程见过但日志已被轮转清理）。 |
+| `reason` | `found=false` 时的原因，见下表；只有真正发生过的事情才会报轮转。 |
 | `segments_returned` | 本次实际返回的片段数。 |
 | `segments_truncated` | 因超过上限被截断、未放入响应的片段数。 |
 | `limits` | 本次生效的上限（见下）。 |
-| `timeline` | 合并后的片段数组；每个片段含 `kind`（`entry`/`downstream`/`background`）、`service`、`seq`、`ts_ms` 及各自字段。 |
+| `timeline` | 合并后的片段数组；每个片段含 `kind`（`entry`/`downstream`/`background`）、`service`、`seq`、`ts_ms` 及各自字段。入口片段另有 `sampled`（`true`/`false`）。 |
 | `summary.total_duration_ms` | 上游入口请求总耗时。 |
-| `summary.slow` / `slowest_stage` | 是否慢请求、最慢阶段名与耗时（慢在哪一段）。 |
+| `summary.slow` / `slowest_stage` | 是否慢请求、最慢阶段名与耗时（慢在哪一段；被采掉细节的锚点入口没有 stages，此时最慢阶段为 `null`）。 |
 | `summary.entry_error_kind` / `error_kinds` | 入口异常分类，以及时间线中出现过的全部异常来源分类（异常来自哪一类）。 |
 | `summary.downstream_calls` / `downstream_mismatches` | 下游调用数与错号数。 |
 | `summary.background_tasks` / `background_failed` | 后台任务数与失败数。 |
+
+查不到（`found=false`）时 `reason` 的准确含义：
+
+| reason | 含义 | 是否发生过轮转 |
+| --- | --- | --- |
+| `unknown` | 本进程**从未写过**带该标识的任何日志行（标识拼错、别的系统/进程的标识、或时间太久已超出"见过的标识"记忆上限）。日志文件可能完好，不能赖轮转。 | 否（或无法判断） |
+| `rotated_away` | 本进程**确实写过**带该标识的日志行，但当前文件和所有保留的轮转备份里都已扫描不到——这些记录是被日志轮转按 `backup_count` 淘汰删除的。 | 是 |
+
+判定依据是"**真正写入**日志的标识"集合（在事件成功落盘那一刻登记），而不是"进过本进程"的请求集合。因此被采样采掉细节的正常请求仍有锚点落盘、能正常回放；只有锚点也被轮转删除时才会报 `rotated_away`，没发生轮转绝不会误报。
 
 上限 / 截断规则（`app/replay.py` 的 `ReplayLimits`，防止一个标识下片段过多撑爆
 内存或响应）：
@@ -132,13 +143,19 @@ uv run pytest -v               # 运行全部测试
 | `rotation_max_bytes` | 1048576 | 单文件最大字节数，超过即轮转。 |
 | `rotation_backup_count` | 3 | 保留的历史文件个数。 |
 
-### 采样策略
+### 采样策略与采样下的回放
 
-- `error_kind != none` 或 `slow == true` 的链路**永远保留**，不会被采掉。
-- 其余请求按 `sample_rate` 随机保留；`0` 表示全部丢弃正常请求，`1` 表示全量保留。
+采样只裁剪正常请求的**细节**，从不删除链路本身：
+
+- `error_kind != none` 或 `slow == true` 的链路**永远保留全量记录**（`sampled=true`，含 stages），不会被采掉。
+- 其余正常请求按 `sample_rate` 随机保留全量记录（`sampled=true`）；被采掉时（`0` 表示全部正常请求都只留锚点，`1` 表示全量保留）仍写一条**精简锚点**（`msg=request, sampled=false`）：包含 `trace_id`、`method`、`path`、`status`、`duration_ms`、`slow`、`slow_threshold_ms`、`error_kind`、`service`、`seq`、`ts_ms`，但**不含 stages 等分阶段细节**。
+- 下游调用片段（`downstream_call`）和后台任务片段（`background_task`）**始终全量记录**，与入口是否被采样无关。
 - 运行中修改采样率只影响之后的判定，已完成的请求不受影响。
-- 无论是否被采掉，每个请求都会计入 `/metrics`（`sampled_out` 字段记录被丢弃数），
-  保证指标与日志结论一致。
+- 无论是否被采掉细节，每个请求都会计入 `/metrics`（`sampled_out` 按原口径记录被采掉细节的正常请求数），保证指标与日志结论一致。
+
+**开启采样后的回放行为**：即使某个正常请求被采掉细节，拿它的 `trace_id` 回放仍能得到完整链路——入口锚点（`timeline` 中 `kind=entry, sampled=false`）、它触发的下游调用（`downstream`）、它挂的后台任务（`background`）都在，时间线排序、汇总计数（下游调用数、错号数、后台任务数/失败数）也都正常。区别仅在于锚点入口没有 stages，`summary.slowest_stage` 为 `null`；入口的 `status`、`duration_ms`、`slow`、`error_kind` 等结论字段仍可查。
+
+**开启采样后的跨服务查询**：上游把 `X-Trace-Id` 透传给下游，下游在同一标识下留下的入口片段（`service=downstream`）与上游的下游调用片段都照常写入、照常可按同一标识查到；演示配置下二者写同一日志文件可直接合并，双进程时查下游进程自己的日志。采样不会让跨服务这条线断掉。进程内下游与上游各自独立做采样判定，互不影响（真实双进程同理）。
 
 ### 日志轮转
 
@@ -164,8 +181,13 @@ uv run pytest -v
   轮转清理后返回 `rotated_away`、片段超限时截断计数、慢标记与最慢阶段。
 - `test_classification.py`：四类（现为五类）异常分类、指标与日志结论一致。
 - `test_slow.py`：慢请求标记与分阶段耗时、阈值边界、运行中改阈值生效。
-- `test_sampling.py`：采样率 0/1 边界、错误与慢请求不被采掉、非法采样率拒绝、
-  运行中改采样率行为可预期。
+- `test_sampling.py`：采样率 0/1 边界、错误与慢请求不被采掉（仍写全量记录）、
+  被采掉的正常请求只留 `sampled=false` 锚点且锚点不含 stages、指标
+  `sampled_out` 口径不变、非法采样率拒绝、运行中改采样率行为可预期。
+- `test_sampled_replay.py`：采样率 0 时正常请求的入口锚点 + 下游调用 + 后台任务
+  仍可按标识完整回放；跨服务下游片段在同一标识下仍可查；从未存在的标识在采样流量
+  之后仍报 `unknown`（不误报轮转）；确实写过又被轮转删除的标识报 `rotated_away`；
+  20 个并发（10 线程）采样请求的片段互不串号。
 - `test_rotation.py`：8 线程 × 200 行并发写入不丢内容（不轮转时 1600/1600）、
   轮转时每一行都是完整 JSON（无交错）。
 
@@ -190,6 +212,19 @@ curl http://127.0.0.1:8000/replay/chain-demo-0001
 curl http://127.0.0.1:8000/replay/no-such-id                 # found=false, reason=unknown
 curl http://127.0.0.1:8000/metrics
 cat logs/requests.log
+
+# 4) 开启采样后回放：把正常请求细节全部采掉，链路仍可完整回放
+curl -X POST http://127.0.0.1:8000/config -H 'content-type: application/json' \
+     -d '{"sample_rate": 0.0}'
+curl -H 'X-Trace-Id: sampled-chain-001' http://127.0.0.1:8000/chain
+curl -H 'X-Trace-Id: sampled-bg-000001' 'http://127.0.0.1:8000/background?fail=true'
+sleep 0.2
+curl http://127.0.0.1:8000/replay/sampled-chain-001        # entry(sampled=false)+downstream
+curl http://127.0.0.1:8000/replay/sampled-bg-000001         # entry 锚点 + failed 后台任务
+curl http://127.0.0.1:8000/replay/no-such-id                # 仍是 unknown，不是 rotated_away
+grep sampled-chain-001 logs/requests.log                    # 锚点 + 下游调用都在，无 stages
+curl -X POST http://127.0.0.1:8000/config -H 'content-type: application/json' \
+     -d '{"sample_rate": 1.0}'
 ```
 
 ### 本地双进程复现（真实 HTTP 套接字）
@@ -216,9 +251,10 @@ grep real-proc-0001 logs/requests.log   # 上游片段；下游片段在下游�
   只包含请求生命周期内已完成的阶段，后台任务作为独立片段参与回放。
 - 后台任务结果存储是进程内内存结构（有总量/单标识上限，最旧优先淘汰），
   重启后丢失；持久化查询以日志文件为准。
-- 回放的 `rotated_away` 判定依赖进程内"见过的标识"有界集合（默认 1 万个）：
-  标识很久以前出现、已被该集合淘汰时，会回退报 `unknown`；跨进程也无法判断，
-  会报 `unknown`。回放本身只读日志，不依赖该集合。
+- 回放的 `rotated_away` 判定依赖进程内"**真正写入过日志**的标识"有界集合
+  （默认 1 万个，LRU 淘汰）：标识对应的日志行很久以前写入、已被该集合淘汰时，
+  会回退报 `unknown`；跨进程也无法判断，会报 `unknown`。回放本身只读日志，
+  不依赖该集合。该集合只在事件成功落盘后登记，因此没发生轮转绝不会误报轮转。
 - 进程内下游（默认）与上游共享日志文件以便演示；真实双进程各自写各自的日志，
   跨进程的完整时间线需要先汇集日志。
 - 日志轮转参数在 handler 创建时固定，运行中修改需重建 logger

@@ -14,7 +14,6 @@ from app.errors import ErrorKind, TracePropagationError
 from app.events import emit_event
 from app.metrics import metrics_registry
 from app.propagate import TRACE_HEADER
-from app.replay import trace_replayer
 from app.sampling import sampling_policy
 
 _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -54,7 +53,6 @@ class TraceMiddleware:
             method=scope.get("method", ""),
         )
         token = set_trace(ctx)
-        trace_replayer.note_seen(ctx.trace_id)
         status_code = 500
         start = time.perf_counter()
         try:
@@ -126,8 +124,27 @@ class TraceMiddleware:
         is_slow = duration_ms >= settings.slow_request_ms
         is_error = ctx.error_kind != ErrorKind.NONE.value
         keep = sampling_policy.should_keep(is_error=is_error, is_slow=is_slow)
+        # Metrics keep their original sampling accounting: every request
+        # is counted; ``sampled_out`` counts exactly the rate-dropped ones.
         metrics_registry.record(error_kind=ctx.error_kind, is_slow=is_slow, logged=keep)
         if not keep:
+            # Sampling trims *detail*, never the trace's existence: every
+            # real request leaves a minimal anchor so the entry, its
+            # downstream calls and its background tasks can still be
+            # replayed by id (and cross-service traces stay joinable).
+            # Stage timings and other bulk fields are what gets dropped.
+            emit_event(
+                "request",
+                service=self.service_name,
+                method=ctx.method,
+                path=ctx.path,
+                status=status_code,
+                duration_ms=round(duration_ms, 3),
+                slow=is_slow,
+                slow_threshold_ms=settings.slow_request_ms,
+                error_kind=ctx.error_kind,
+                sampled=False,
+            )
             return
         emit_event(
             "request",
@@ -139,5 +156,6 @@ class TraceMiddleware:
             slow=is_slow,
             slow_threshold_ms=settings.slow_request_ms,
             error_kind=ctx.error_kind,
+            sampled=True,
             stages=[{"name": s.name, "duration_ms": s.duration_ms} for s in ctx.stages],
         )

@@ -54,7 +54,17 @@ class TraceReplayer:
         self._seen_cap = seen_cap
 
     def note_seen(self, trace_id: str) -> None:
-        """Record that a trace id was emitted in this process (rotation hint)."""
+        """Record that an event for this id was actually written.
+
+        This is invoked from the event-emission path (i.e. a JSON line
+        was really appended to a log file), *not* at request entry, so a
+        request that never produced any on-disk line is never mistaken
+        for one whose lines were later rotated away.
+
+        Bounded LRU: ids older than ``seen_cap`` are forgotten; a replay
+        for such an id after its lines were rotated away then falls back
+        to ``unknown`` (see ``replay``/README known limitations).
+        """
         with self._seen_lock:
             self._seen.pop(trace_id, None)
             self._seen[trace_id] = None
@@ -132,6 +142,7 @@ class TraceReplayer:
                 duration_ms=event.get("duration_ms"),
                 slow=event.get("slow"),
                 error_kind=event.get("error_kind", "none"),
+                sampled=event.get("sampled", True),
                 stages=stages,
             )
         elif kind == "downstream":
@@ -159,9 +170,19 @@ class TraceReplayer:
     def replay(self, trace_id: str) -> dict:
         """Return the merged timeline, or an explicit not-found result.
 
-        ``found`` is False for unknown ids and for ids whose segments
-        were rotated away; ``reason`` distinguishes ``unknown`` from
-        ``rotated_away``.
+        ``found`` is False in two distinct cases:
+
+        * ``unknown`` — this process has never written a line carrying
+          the id (or any such memory predates the bounded seen-set). No
+          rotation has erased anything; the id simply does not exist
+          here.
+        * ``rotated_away`` — this process really did write a line with
+          the id, but no matching segment remains in the current file or
+          any retained backup, i.e. the records were deleted by rotation.
+
+        Because the seen-set is fed only from the actual write path, a
+        request that merely passed through (e.g. sampled out) can never
+        be misreported as ``rotated_away``.
         """
         settings = settings_holder.get()
         segments, truncated = self._read_segments(
