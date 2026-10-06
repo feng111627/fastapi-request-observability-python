@@ -28,15 +28,28 @@ class SamplingPolicy:
         with self._lock:
             self._rate = rate
 
-    def should_keep(self, *, is_error: bool, is_slow: bool) -> bool:
-        if is_error or is_slow:
-            return True
+    def decide(self) -> bool:
+        """Pre-decide, at request start, whether a request is logged to the
+        main log assuming it turns out neither erroneous nor slow.
+
+        Errors and slow requests cannot be known yet at request start, so
+        the final keep/drop is ``is_error or is_slow or decide()``; the
+        pre-decision only routes segments of *normal* requests. The draw
+        is made once per request and stored on its trace context, so all
+        segments of one request (entry, downstream calls, background
+        tasks) are routed consistently.
+        """
         rate = self.rate
         if rate >= 1.0:
             return True
         if rate <= 0.0:
             return False
         return random.random() < rate
+
+    def should_keep(self, *, is_error: bool, is_slow: bool) -> bool:
+        if is_error or is_slow:
+            return True
+        return self.decide()
 
 
 sampling_policy = SamplingPolicy()

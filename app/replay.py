@@ -2,12 +2,16 @@
 
 Given a trace id, merge every segment belonging to it — the entry
 request, downstream calls and background tasks — from the JSON log
-files (current file plus retained rotation backups) into one timeline.
+files into one timeline. Two logs are searched: the main log (kept
+requests) and the replay-buffer log (segments of sampled-out requests),
+each with their retained rotation backups.
 
 Unknown ids and ids whose records have been rotated away are reported
-explicitly (never an error/500). Segment counts, stage counts and
-field lengths are capped so a trace with very many segments cannot blow
-up memory or the response.
+explicitly (never an error/500). A trace id counts as "seen" only when
+a segment was actually written to one of the logs, so a request that
+was merely sampled out is never misreported as rotated away. Segment
+counts, stage counts and field lengths are capped so a trace with very
+many segments cannot blow up memory or the response.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import threading
 from collections import OrderedDict
 
 from app.config import settings_holder
+from app.logging_setup import replay_log_file
 
 
 class ReplayLimits:
@@ -70,12 +75,17 @@ class TraceReplayer:
             self._seen.clear()
 
     def _log_files(self, log_dir: str, log_file: str) -> list[str]:
-        paths = sorted(
-            glob.glob(os.path.join(log_dir, log_file + "*")),
-            key=lambda p: (os.path.getmtime(p), p),
-            reverse=True,
-        )
-        return paths[: self.limits.max_files]
+        # Main log plus the replay-buffer log (sampled-out requests),
+        # each with their own rotation backups; capped per pattern.
+        paths: list[str] = []
+        for name in (log_file, replay_log_file(log_file)):
+            matches = sorted(
+                glob.glob(os.path.join(log_dir, name + "*")),
+                key=lambda p: (os.path.getmtime(p), p),
+                reverse=True,
+            )
+            paths.extend(matches[: self.limits.max_files])
+        return paths
 
     def _read_segments(self, trace_id: str, log_dir: str, log_file: str):
         segments: list[dict] = []

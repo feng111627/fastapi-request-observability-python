@@ -46,6 +46,19 @@ _loggers: dict[str, logging.Logger] = {}
 _loggers_lock = threading.Lock()
 
 
+def replay_log_file(log_file: str) -> str:
+    """Name of the replay-buffer log derived from the main log file name.
+
+    Sampled-out requests' segments go here instead of the main log, so
+    the main log keeps only kept requests while every trace that really
+    happened stays replayable by id. ``requests.log`` maps to
+    ``requests.replay.log``, which the main log's ``requests.log*`` glob
+    does not match.
+    """
+    root, ext = os.path.splitext(log_file)
+    return f"{root}.replay{ext or '.log'}"
+
+
 def get_request_logger(log_dir: str, log_file: str, max_bytes: int, backup_count: int) -> logging.Logger:
     """Return (creating once) a JSON logger writing to a rotating file."""
     os.makedirs(log_dir, exist_ok=True)

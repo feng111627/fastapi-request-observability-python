@@ -25,6 +25,13 @@ class TraceContext:
     method: str = ""
     error_kind: str = "none"
     stages: list[StageTiming] = field(default_factory=list)
+    # Pre-decided at request start: True means this request's segments go
+    # to the replay buffer instead of the main log, unless the request
+    # turns out to be an error or slow (those are always kept in the
+    # main log). Lives in the context so background tasks inheriting the
+    # context route their segments the same way, and concurrent requests
+    # never see each other's flag.
+    sampled_out: bool = False
 
     def add_stage(self, name: str, duration_ms: float) -> None:
         self.stages.append(StageTiming(name=name, duration_ms=round(duration_ms, 3)))

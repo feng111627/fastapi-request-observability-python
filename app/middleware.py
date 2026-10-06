@@ -14,7 +14,6 @@ from app.errors import ErrorKind, TracePropagationError
 from app.events import emit_event
 from app.metrics import metrics_registry
 from app.propagate import TRACE_HEADER
-from app.replay import trace_replayer
 from app.sampling import sampling_policy
 
 _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -53,8 +52,12 @@ class TraceMiddleware:
             path=scope.get("path", ""),
             method=scope.get("method", ""),
         )
+        # One sampling draw per request, up front: every segment emitted
+        # while this context is ambient (entry, downstream calls,
+        # background tasks inheriting the context) is routed the same
+        # way. Errors/slow requests are still kept at finalize time.
+        ctx.sampled_out = not sampling_policy.decide()
         token = set_trace(ctx)
-        trace_replayer.note_seen(ctx.trace_id)
         status_code = 500
         start = time.perf_counter()
         try:
@@ -125,10 +128,14 @@ class TraceMiddleware:
     ) -> None:
         is_slow = duration_ms >= settings.slow_request_ms
         is_error = ctx.error_kind != ErrorKind.NONE.value
-        keep = sampling_policy.should_keep(is_error=is_error, is_slow=is_slow)
+        # Errors and slow requests are always kept in the main log; a
+        # normal request follows the sampling draw made at request start.
+        # Sampled-out requests are not dropped: their segments go to the
+        # replay-buffer log so the trace stays replayable by id.
+        keep = is_error or is_slow or not ctx.sampled_out
         metrics_registry.record(error_kind=ctx.error_kind, is_slow=is_slow, logged=keep)
-        if not keep:
-            return
+        if keep:
+            ctx.sampled_out = False  # route the entry segment to the main log
         emit_event(
             "request",
             service=self.service_name,
